@@ -248,9 +248,12 @@ impl<RS: Read + Seek> Xls<RS> {
                     }
                     // RRTabId
                     0x0085 => {
-                        let (pos, name) = parse_sheet_name(&mut r, &mut encoding)?;
-                        self.metadata.sheets.push(name.clone());
-                        sheet_names.push((pos, name)); // BoundSheet8
+                        if r.data[5] == 0 {
+                            // Only add Worksheets and ignore Macrosheet, Chartsheet, etc.
+                            let (pos, name) = parse_sheet_name(&mut r, &mut encoding)?;
+                            self.metadata.sheets.push(name.clone());
+                            sheet_names.push((pos, name)); // BoundSheet8
+                        }
                     }
                     0x0018 => {
                         // Lbl for defined_names
