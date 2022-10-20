@@ -830,3 +830,24 @@ fn issue_271() -> Result<(), calamine::Error> {
 
     Ok(())
 }
+
+#[test]
+fn ignore_non_worksheets_xlsx() {
+    let path = format!("{}/tests/chartsheet.xlsx", env!("CARGO_MANIFEST_DIR"));
+    let book = open_workbook_auto(path).unwrap();
+    assert_eq!(book.sheet_names(), &["Sheet1"]);
+}
+
+#[test]
+fn ignore_non_worksheets_xlsb() {
+    let path = format!("{}/tests/chartsheet.xlsb", env!("CARGO_MANIFEST_DIR"));
+    let book = open_workbook_auto(path).unwrap();
+    assert_eq!(book.sheet_names(), &["Sheet1"]);
+}
+
+#[test]
+fn ignore_non_worksheets_xls() {
+    let path = format!("{}/tests/chartsheet.xls", env!("CARGO_MANIFEST_DIR"));
+    let book = open_workbook_auto(path).unwrap();
+    assert_eq!(book.sheet_names(), &["Sheet1"]);
+}

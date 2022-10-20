@@ -315,8 +315,10 @@ impl<RS: Read + Seek> Xlsx<RS> {
                             _ => (),
                         }
                     }
-                    self.metadata.sheets.push(name.to_string());
-                    self.sheets.push((name, path));
+                    if path.contains("/worksheets/") {
+                        self.metadata.sheets.push(name.to_string());
+                        self.sheets.push((name, path));
+                    }
                 }
                 Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"definedName" => {
                     if let Some(a) = e
