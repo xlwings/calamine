@@ -13,6 +13,7 @@ use quick_xml::Reader as XmlReader;
 use zip::read::{ZipArchive, ZipFile};
 use zip::result::ZipError;
 
+use crate::formats::{is_builtin_date_format_id, is_custom_date_format};
 use crate::utils::{push_column, read_f64, read_i32, read_u16, read_u32, read_usize};
 use crate::vba::VbaProject;
 use crate::{Cell, CellErrorType, DataType, Metadata, Range, Reader};
@@ -108,13 +109,23 @@ impl std::error::Error for XlsbError {
     }
 }
 
+#[derive(Debug)]
+enum CellFormat {
+    Other,
+    Date,
+}
+
 /// A Xlsb reader
 pub struct Xlsb<RS> {
     zip: ZipArchive<RS>,
     extern_sheets: Vec<String>,
     sheets: Vec<(String, String)>,
     strings: Vec<String>,
+    /// Cell (number) formats
+    formats: Vec<CellFormat>,
     metadata: Metadata,
+    #[cfg(feature = "picture")]
+    pictures: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl<RS: Read + Seek> Xlsb<RS> {
@@ -167,6 +178,47 @@ impl<RS: Read + Seek> Xlsb<RS> {
             Err(e) => return Err(XlsbError::Zip(e)),
         }
         Ok(relationships)
+    }
+
+    /// MS-XLSB 2.1.7.50 Styles
+    fn read_styles(&mut self) -> Result<(), XlsbError> {
+        let mut iter = match RecordIter::from_zip(&mut self.zip, "xl/styles.bin") {
+            Ok(iter) => iter,
+            Err(_) => return Ok(()), // it is fine if path does not exists
+        };
+        let mut buf = vec![0; 1024];
+        let mut number_formats = BTreeMap::new();
+
+        // Search for BrtBeginFmts
+        if iter.next_skip_blocks(0x0267, &[], &mut buf).is_ok() {
+            let len = read_usize(&buf);
+
+            for _ in 0..len {
+                let _ = iter.next_skip_blocks(0x002C, &[], &mut buf)?; // BrtFmt
+                let fmt_code = read_u16(&buf);
+                let fmt_string = wide_str(&buf[2..], &mut 0)?.into_owned();
+                number_formats.insert(fmt_code, fmt_string);
+            }
+
+            // Search for BrtBeginCellXFs
+            if iter.next_skip_blocks(0x0269, &[], &mut buf).is_ok() {
+                let len = read_usize(&buf);
+
+                for _ in 0..len {
+                    let _ = iter.next_skip_blocks(0x002F, &[], &mut buf)?; // BrtXF
+                    let num_fmt = read_u16(&buf[2..4]);
+                    self.formats.push(match number_formats.get(&num_fmt) {
+                        Some(fmt) if is_custom_date_format(fmt) => CellFormat::Date,
+                        None if is_builtin_date_format_id(num_fmt.to_string().as_bytes()) => {
+                            CellFormat::Date
+                        }
+                        _ => CellFormat::Other,
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// MS-XLSB 2.1.7.45
@@ -296,7 +348,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
     fn worksheet_range_from_path(&mut self, path: String) -> Result<Range<DataType>, XlsbError> {
         let mut iter = RecordIter::from_zip(&mut self.zip, &path)?;
         let mut buf = vec![0; 1024];
-
+        let formats = &self.formats;
         // BrtWsDim
         let _ = iter.next_skip_blocks(
             0x0094,
@@ -342,10 +394,17 @@ impl<RS: Read + Seek> Xlsb<RS> {
                     let d100 = (buf[8] & 1) != 0;
                     let is_int = (buf[8] & 2) != 0;
                     buf[8] &= 0xFC;
+                    let is_date = is_cell_date(formats, &buf);
+
                     if is_int {
                         let v = (read_i32(&buf[8..12]) >> 2) as i64;
                         if d100 {
-                            DataType::Float((v as f64) / 100.0)
+                            let v = (v as f64) / 100.0;
+                            if is_date {
+                                DataType::DateTime(v)
+                            } else {
+                                DataType::Float(v)
+                            }
                         } else {
                             DataType::Int(v)
                         }
@@ -353,7 +412,12 @@ impl<RS: Read + Seek> Xlsb<RS> {
                         let mut v = [0u8; 8];
                         v[4..].copy_from_slice(&buf[8..12]);
                         let v = read_f64(&v);
-                        DataType::Float(if d100 { v / 100.0 } else { v })
+                        let v = if d100 { v / 100.0 } else { v };
+                        if is_date {
+                            DataType::DateTime(v)
+                        } else {
+                            DataType::Float(v)
+                        }
                     }
                 }
                 0x0003 => {
@@ -372,7 +436,15 @@ impl<RS: Read + Seek> Xlsb<RS> {
                     DataType::Error(error)
                 }
                 0x0004 | 0x000A => DataType::Bool(buf[8] != 0), // BrtCellBool or BrtFmlaBool
-                0x0005 | 0x0009 => DataType::Float(read_f64(&buf[8..16])), // BrtCellReal or BrtFmlaFloat
+                0x0005 | 0x0009 => {
+                    let is_date = is_cell_date(formats, &buf);
+                    let v = read_f64(&buf[8..16]);
+                    if is_date {
+                        DataType::DateTime(v)
+                    } else {
+                        DataType::Float(v)
+                    }
+                } // BrtCellReal or BrtFmlaNum
                 0x0006 | 0x0008 => DataType::String(wide_str(&buf[8..], &mut 0)?.into_owned()), // BrtCellSt or BrtFmlaString
                 0x0007 => {
                     // BrtCellIsst
@@ -487,6 +559,34 @@ impl<RS: Read + Seek> Xlsb<RS> {
             }
         }
     }
+
+    #[cfg(feature = "picture")]
+    fn read_pictures(&mut self) -> Result<(), XlsbError> {
+        let mut pics = Vec::new();
+        for i in 0..self.zip.len() {
+            let mut zfile = self.zip.by_index(i)?;
+            let zname = zfile.name().to_owned();
+            if zname.starts_with("xl/media") {
+                let name_ext: Vec<&str> = zname.split(".").collect();
+                if let Some(ext) = name_ext.last() {
+                    if [
+                        "emf", "wmf", "pict", "jpeg", "jpg", "png", "dib", "gif", "tiff", "eps",
+                        "bmp", "wpg",
+                    ]
+                    .contains(ext)
+                    {
+                        let mut buf: Vec<u8> = Vec::new();
+                        zfile.read_to_end(&mut buf)?;
+                        pics.push((ext.to_string(), buf));
+                    }
+                }
+            }
+        }
+        if !pics.is_empty() {
+            self.pictures = Some(pics);
+        }
+        Ok(())
+    }
 }
 
 impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
@@ -498,11 +598,17 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
             sheets: Vec::new(),
             strings: Vec::new(),
             extern_sheets: Vec::new(),
+            formats: Vec::new(),
             metadata: Metadata::default(),
+            #[cfg(feature = "picture")]
+            pictures: None,
         };
         xlsb.read_shared_strings()?;
+        xlsb.read_styles()?;
         let relationships = xlsb.read_relationships()?;
         xlsb.read_workbook(&relationships)?;
+        #[cfg(feature = "picture")]
+        xlsb.read_pictures()?;
 
         Ok(xlsb)
     }
@@ -522,8 +628,8 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
 
     /// MS-XLSB 2.1.7.62
     fn worksheet_range(&mut self, name: &str) -> Option<Result<Range<DataType>, XlsbError>> {
-        let path = match self.sheets.iter().find(|&&(ref n, _)| n == name) {
-            Some(&(_, ref path)) => path.clone(),
+        let path = match self.sheets.iter().find(|&(n, _)| n == name) {
+            Some((_, path)) => path.clone(),
             None => return None,
         };
         Some(self.worksheet_range_from_path(path))
@@ -531,8 +637,8 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
 
     /// MS-XLSB 2.1.7.62
     fn worksheet_formula(&mut self, name: &str) -> Option<Result<Range<String>, XlsbError>> {
-        let path = match self.sheets.iter().find(|&&(ref n, _)| n == name) {
-            Some(&(_, ref path)) => path.clone(),
+        let path = match self.sheets.iter().find(|&(n, _)| n == name) {
+            Some((_, path)) => path.clone(),
             None => return None,
         };
         Some(self.worksheet_formula_from_path(path))
@@ -548,6 +654,11 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
                 Some((name, ws))
             })
             .collect()
+    }
+
+    #[cfg(feature = "picture")]
+    fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        self.pictures.to_owned()
     }
 }
 
@@ -628,7 +739,7 @@ impl<'a> RecordIter<'a> {
     }
 }
 
-fn wide_str<'a, 'b>(buf: &'a [u8], str_len: &'b mut usize) -> Result<Cow<'a, str>, XlsbError> {
+fn wide_str<'a>(buf: &'a [u8], str_len: &mut usize) -> Result<Cow<'a, str>, XlsbError> {
     let len = read_u32(buf) as usize;
     if buf.len() < 4 + len * 2 {
         return Err(XlsbError::WideStr {
@@ -773,7 +884,7 @@ fn parse_formula(
                 stack.push(formula.len());
                 formula.push('\"');
                 let cch = read_u16(&rgce[0..2]) as usize;
-                formula.push_str(&*UTF_16LE.decode(&rgce[2..2 + 2 * cch]).0);
+                formula.push_str(&UTF_16LE.decode(&rgce[2..2 + 2 * cch]).0);
                 formula.push('\"');
                 rgce = &rgce[2 + 2 * cch..];
             }
@@ -953,5 +1064,17 @@ fn parse_formula(
         Err(XlsbError::StackLen)
     } else {
         Ok(formula)
+    }
+}
+
+fn is_cell_date(formats: &[CellFormat], buf: &[u8]) -> bool {
+    // Parses a Cell (MS-XLSB 2.5.9) and determines if it references a Date format
+
+    // iStyleRef is stored as a 24bit integer starting at the fifth byte
+    let style_ref = u32::from_le_bytes([buf[4], buf[5], buf[6], 0]);
+
+    match formats.get(style_ref as usize) {
+        Some(CellFormat::Date) => true,
+        _ => false,
     }
 }

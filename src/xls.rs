@@ -9,9 +9,15 @@ use std::marker::PhantomData;
 use log::debug;
 
 use crate::cfb::{Cfb, XlsEncoding};
+use crate::formats::{is_builtin_date_format_id, is_custom_date_format};
+#[cfg(feature = "picture")]
+use crate::utils::read_usize;
 use crate::utils::{push_column, read_f64, read_i32, read_u16, read_u32};
 use crate::vba::VbaProject;
 use crate::{Cell, CellErrorType, DataType, Metadata, Range, Reader};
+
+/// https://learn.microsoft.com/en-us/office/troubleshoot/excel/1900-and-1904-date-system
+static EXCEL_1900_1904_DIFF: i64 = 1462;
 
 #[derive(Debug)]
 /// An enum to handle Xls specific errors
@@ -59,6 +65,9 @@ pub enum XlsError {
     Etpg(u8),
     /// No vba project
     NoVba,
+    /// Invalid OfficeArt Record
+    #[cfg(feature = "picture")]
+    Art(&'static str),
 }
 
 from_err!(std::io::Error, XlsError, Io);
@@ -94,6 +103,8 @@ impl std::fmt::Display for XlsError {
             XlsError::IfTab(iftab) => write!(f, "Invalid iftab {:X}", iftab),
             XlsError::Etpg(etpg) => write!(f, "Invalid etpg {:X}", etpg),
             XlsError::NoVba => write!(f, "No VBA project"),
+            #[cfg(feature = "picture")]
+            XlsError::Art(s) => write!(f, "Invalid art record '{}'", s),
         }
     }
 }
@@ -124,6 +135,13 @@ pub struct XlsOptions {
     pub force_codepage: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CellFormat {
+    Other,
+    /// bool - is_1904
+    Date(bool),
+}
+
 /// A struct representing an old xls format file (CFB)
 pub struct Xls<RS> {
     sheets: BTreeMap<String, (Range<DataType>, Range<String>)>,
@@ -131,6 +149,9 @@ pub struct Xls<RS> {
     metadata: Metadata,
     marker: PhantomData<RS>,
     options: XlsOptions,
+    formats: Vec<CellFormat>,
+    #[cfg(feature = "picture")]
+    pictures: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl<RS: Read + Seek> Xls<RS> {
@@ -173,6 +194,9 @@ impl<RS: Read + Seek> Xls<RS> {
             marker: PhantomData,
             metadata: Metadata::default(),
             options,
+            formats: Vec::new(),
+            #[cfg(feature = "picture")]
+            pictures: None,
         };
 
         xls.parse_workbook(reader, cfb)?;
@@ -213,6 +237,11 @@ impl<RS: Read + Seek> Reader<RS> for Xls<RS> {
     fn worksheet_formula(&mut self, name: &str) -> Option<Result<Range<String>, XlsError>> {
         self.sheets.get(name).map(|r| Ok(r.1.clone()))
     }
+
+    #[cfg(feature = "picture")]
+    fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        self.pictures.to_owned()
+    }
 }
 
 impl<RS: Read + Seek> Xls<RS> {
@@ -226,8 +255,13 @@ impl<RS: Read + Seek> Xls<RS> {
         let mut strings = Vec::new();
         let mut defined_names = Vec::new();
         let mut xtis = Vec::new();
+        let mut formats = BTreeMap::new();
+        let mut xfs = Vec::new();
+        let mut is_1904 = false;
         let codepage = self.options.force_codepage.unwrap_or(1200);
         let mut encoding = XlsEncoding::from_codepage(codepage)?;
+        #[cfg(feature = "picture")]
+        let mut draw_group: Vec<u8> = Vec::new();
         {
             let wb = &stream;
             let records = RecordIter { stream: wb };
@@ -245,6 +279,21 @@ impl<RS: Read + Seek> Xls<RS> {
                         let sheet_len = r.data.len() / 2;
                         sheet_names.reserve(sheet_len);
                         self.metadata.sheets.reserve(sheet_len);
+                    }
+                    // Date1904
+                    0x0022 => {
+                        if read_u16(r.data) == 1 {
+                            is_1904 = true
+                        }
+                    }
+                    // FORMATTING
+                    0x041E => {
+                        let (idx, format) = parse_format(&mut r, &mut encoding, is_1904)?;
+                        formats.insert(idx, format);
+                    }
+                    // XFS
+                    0x00E0 => {
+                        xfs.push(parse_xf(&mut r)?);
                     }
                     // RRTabId
                     0x0085 => {
@@ -281,11 +330,32 @@ impl<RS: Read + Seek> Xls<RS> {
                         );
                     }
                     0x00FC => strings = parse_sst(&mut r, &mut encoding)?, // SST
-                    0x000A => break,                                       // EOF,
+                    #[cfg(feature = "picture")]
+                    0x00EB => {
+                        // MsoDrawingGroup
+                        draw_group.extend(r.data);
+                        if let Some(cont) = r.cont {
+                            draw_group.extend(cont.iter().flat_map(|v| *v));
+                        }
+                    }
+                    0x000A => break, // EOF,
                     _ => (),
                 }
             }
         }
+
+        self.formats = xfs
+            .into_iter()
+            .map(|fmt| match formats.get(&fmt) {
+                Some(s) => *s,
+                None if is_builtin_date_format_id(fmt.to_string().as_bytes()) => {
+                    CellFormat::Date(is_1904)
+                }
+                _ => CellFormat::Other,
+            })
+            .collect();
+
+        debug!("formats: {:?}", self.formats);
 
         let defined_names = defined_names
             .into_iter()
@@ -307,7 +377,7 @@ impl<RS: Read + Seek> Xls<RS> {
         let mut sheets = BTreeMap::new();
         let fmla_sheet_names = sheet_names
             .iter()
-            .map(|&(_, ref n)| n.clone())
+            .map(|(_, n)| n.clone())
             .collect::<Vec<_>>();
         for (pos, name) in sheet_names {
             let sh = &stream[pos..];
@@ -325,12 +395,12 @@ impl<RS: Read + Seek> Xls<RS> {
                         cells.reserve(rows.saturating_mul(cols));
                     }
                     //0x0201 => cells.push(parse_blank(r.data)?), // 513: Blank
-                    0x0203 => cells.push(parse_number(r.data)?), // 515: Number
-                    0x0205 => cells.push(parse_bool_err(r.data)?), // 517: BoolErr
-                    0x027E => cells.push(parse_rk(r.data)?),     // 636: Rk
+                    0x0203 => cells.push(parse_number(r.data, &self.formats)?), // 515: Number
+                    0x0205 => cells.push(parse_bool_err(r.data)?),              // 517: BoolErr
+                    0x027E => cells.push(parse_rk(r.data, &self.formats)?),     // 636: Rk
                     0x00FD => cells.extend(parse_label_sst(r.data, &strings)?), // LabelSst
-                    0x00BD => parse_mul_rk(r.data, &mut cells)?, // 189: MulRk
-                    0x000A => break,                             // 10: EOF,
+                    0x00BD => parse_mul_rk(r.data, &mut cells, &self.formats)?, // 189: MulRk
+                    0x000A => break,                                            // 10: EOF,
                     0x0006 => {
                         // 6: Formula
                         let row = read_u16(r.data);
@@ -362,6 +432,14 @@ impl<RS: Read + Seek> Xls<RS> {
         self.sheets = sheets;
         self.metadata.names = defined_names;
 
+        #[cfg(feature = "picture")]
+        if !draw_group.is_empty() {
+            let pics = parse_pictures(&draw_group)?;
+            if !pics.is_empty() {
+                self.pictures = Some(pics);
+            }
+        }
+
         Ok(())
     }
 }
@@ -384,7 +462,7 @@ fn parse_sheet_name(
     Ok((pos, sheet_name))
 }
 
-fn parse_number(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
+fn parse_number(r: &[u8], formats: &[CellFormat]) -> Result<Cell<DataType>, XlsError> {
     if r.len() < 14 {
         return Err(XlsError::Len {
             typ: "number",
@@ -395,7 +473,9 @@ fn parse_number(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
     let row = read_u16(r) as u32;
     let col = read_u16(&r[2..]) as u32;
     let v = read_f64(&r[6..]);
-    Ok(Cell::new((row, col), DataType::Float(v)))
+    let format = formats.get(read_u16(&r[4..]) as usize);
+
+    Ok(Cell::new((row, col), check_f64_is_date(v, format)))
 }
 
 fn parse_bool_err(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
@@ -436,7 +516,7 @@ fn parse_bool_err(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
     Ok(Cell::new((row as u32, col as u32), v))
 }
 
-fn parse_rk(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
+fn parse_rk(r: &[u8], formats: &[CellFormat]) -> Result<Cell<DataType>, XlsError> {
     if r.len() < 10 {
         return Err(XlsError::Len {
             typ: "rk",
@@ -446,10 +526,18 @@ fn parse_rk(r: &[u8]) -> Result<Cell<DataType>, XlsError> {
     }
     let row = read_u16(r);
     let col = read_u16(&r[2..]);
-    Ok(Cell::new((row as u32, col as u32), rk_num(&r[6..10])))
+
+    Ok(Cell::new(
+        (row as u32, col as u32),
+        rk_num(&r[4..10], formats),
+    ))
 }
 
-fn parse_mul_rk(r: &[u8], cells: &mut Vec<Cell<DataType>>) -> Result<(), XlsError> {
+fn parse_mul_rk(
+    r: &[u8],
+    cells: &mut Vec<Cell<DataType>>,
+    formats: &[CellFormat],
+) -> Result<(), XlsError> {
     if r.len() < 6 {
         return Err(XlsError::Len {
             typ: "rk",
@@ -473,30 +561,30 @@ fn parse_mul_rk(r: &[u8], cells: &mut Vec<Cell<DataType>>) -> Result<(), XlsErro
     let mut col = col_first as u32;
 
     for rk in r[4..r.len() - 2].chunks(6) {
-        // ignore ixfe format on the 2 first bytes
-        cells.push(Cell::new((row as u32, col), rk_num(&rk[2..])));
+        cells.push(Cell::new((row as u32, col), rk_num(rk, formats)));
         col += 1;
     }
     Ok(())
 }
 
-fn rk_num(rk: &[u8]) -> DataType {
-    let d100 = (rk[0] & 1) != 0;
-    let is_int = (rk[0] & 2) != 0;
+fn rk_num(rk: &[u8], formats: &[CellFormat]) -> DataType {
+    let d100 = (rk[2] & 1) != 0;
+    let is_int = (rk[2] & 2) != 0;
+    let format = formats.get(read_u16(rk) as usize);
 
     let mut v = [0u8; 8];
-    v[4..].copy_from_slice(rk);
+    v[4..].copy_from_slice(&rk[2..]);
     v[4] &= 0xFC;
     if is_int {
         let v = (read_i32(&v[4..8]) >> 2) as i64;
         if d100 && v % 100 != 0 {
-            DataType::Float(v as f64 / 100.0)
+            check_f64_is_date(v as f64 / 100.0, format)
         } else {
-            DataType::Int(if d100 { v / 100 } else { v })
+            check_i64_is_date(if d100 { v / 100 } else { v }, format)
         }
     } else {
         let v = read_f64(&v);
-        DataType::Float(if d100 { v / 100.0 } else { v })
+        check_f64_is_date(if d100 { v / 100.0 } else { v }, format)
     }
 }
 
@@ -595,6 +683,70 @@ fn parse_sst(r: &mut Record<'_>, encoding: &mut XlsEncoding) -> Result<Vec<Strin
         sst.push(read_rich_extended_string(r, encoding)?);
     }
     Ok(sst)
+}
+
+/// Decode XF (extract only ifmt - Format identifier)
+///
+/// See: https://learn.microsoft.com/ru-ru/openspecs/office_file_formats/ms-xls/993d15c4-ec04-43e9-ba36-594dfb336c6d
+fn parse_xf(r: &mut Record<'_>) -> Result<u16, XlsError> {
+    if r.data.len() < 4 {
+        return Err(XlsError::Len {
+            typ: "xf",
+            expected: 4,
+            found: r.data.len(),
+        });
+    }
+
+    Ok(read_u16(&r.data[2..]))
+}
+
+/// Decode Format
+///
+/// See: https://learn.microsoft.com/ru-ru/openspecs/office_file_formats/ms-xls/300280fd-e4fe-4675-a924-4d383af48d3b
+fn parse_format(
+    r: &mut Record<'_>,
+    encoding: &mut XlsEncoding,
+    is_1904: bool,
+) -> Result<(u16, CellFormat), XlsError> {
+    if r.data.len() < 4 {
+        return Err(XlsError::Len {
+            typ: "format",
+            expected: 4,
+            found: r.data.len(),
+        });
+    }
+
+    let idx = read_u16(r.data);
+
+    let cch = read_u16(&r.data[2..]) as usize;
+    let high_byte = r.data[4] & 0x1 != 0;
+    r.data = &r.data[5..];
+    let mut s = String::with_capacity(cch);
+    encoding.decode_to(r.data, cch, &mut s, Some(high_byte));
+
+    if is_custom_date_format(&s) {
+        Ok((idx, CellFormat::Date(is_1904)))
+    } else {
+        Ok((idx, CellFormat::Other))
+    }
+}
+
+// convert i64 to date, if format == Date
+fn check_i64_is_date(value: i64, format: Option<&CellFormat>) -> DataType {
+    match format {
+        Some(CellFormat::Date(false)) => DataType::DateTime(value as f64),
+        Some(CellFormat::Date(true)) => DataType::DateTime((value + EXCEL_1900_1904_DIFF) as f64),
+        _ => DataType::Int(value),
+    }
+}
+
+// convert f64 to date, if format == Date
+fn check_f64_is_date(value: f64, format: Option<&CellFormat>) -> DataType {
+    match format {
+        Some(CellFormat::Date(false)) => DataType::DateTime(value),
+        Some(CellFormat::Date(true)) => DataType::DateTime(value + EXCEL_1900_1904_DIFF as f64),
+        _ => DataType::Float(value),
+    }
 }
 
 /// Decode XLUnicodeRichExtendedString.
@@ -1122,4 +1274,143 @@ fn parse_formula(
     } else {
         Ok(formula)
     }
+}
+
+/// OfficeArtRecord [MS-ODRAW 1.3.1]
+#[cfg(feature = "picture")]
+struct ArtRecord<'a> {
+    instance: u16,
+    typ: u16,
+    data: &'a [u8],
+}
+
+#[cfg(feature = "picture")]
+struct ArtRecordIter<'a> {
+    stream: &'a [u8],
+}
+
+#[cfg(feature = "picture")]
+impl<'a> Iterator for ArtRecordIter<'a> {
+    type Item = Result<ArtRecord<'a>, XlsError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stream.len() < 8 {
+            return if self.stream.is_empty() {
+                None
+            } else {
+                Some(Err(XlsError::EoStream("art record header")))
+            };
+        }
+        let ver_ins = read_u16(self.stream);
+        let instance = ver_ins >> 4;
+        let typ = read_u16(&self.stream[2..]);
+        if typ < 0xF000 {
+            return Some(Err(XlsError::Art("type range 0xF000 - 0xFFFF")));
+        }
+        let len = read_usize(&self.stream[4..]);
+        if self.stream.len() < len + 8 {
+            return Some(Err(XlsError::EoStream("art record length")));
+        }
+        let (d, next) = self.stream.split_at(len + 8);
+        self.stream = next;
+        let data = &d[8..];
+
+        Some(Ok(ArtRecord {
+            instance,
+            typ,
+            data,
+        }))
+    }
+}
+
+/// Parsing pictures
+#[cfg(feature = "picture")]
+fn parse_pictures(stream: &[u8]) -> Result<Vec<(String, Vec<u8>)>, XlsError> {
+    let mut pics = Vec::new();
+    let records = ArtRecordIter { stream };
+    for record in records {
+        let r = record?;
+        match r.typ {
+            // OfficeArtDggContainer [MS-ODRAW 2.2.12]
+            // OfficeArtBStoreContainer [MS-ODRAW 2.2.20]
+            0xF000 | 0xF001 => pics.extend(parse_pictures(r.data)?),
+            // OfficeArtFBSE [MS-ODRAW 2.2.32]
+            0xF007 => {
+                let skip = 36 + r.data[33] as usize;
+                pics.extend(parse_pictures(&r.data[skip..])?);
+            }
+            // OfficeArtBlip [MS-ODRAW 2.2.23]
+            0xF01A | 0xF01B | 0xF01C | 0xF01D | 0xF01E | 0xF01F | 0xF029 | 0xF02A => {
+                let ext_skip = match r.typ {
+                    // OfficeArtBlipEMF [MS-ODRAW 2.2.24]
+                    0xF01A => {
+                        let skip = match r.instance {
+                            0x3D4 => 50usize,
+                            0x3D5 => 66,
+                            _ => unreachable!(),
+                        };
+                        Ok(("emf", skip))
+                    }
+                    // OfficeArtBlipWMF [MS-ODRAW 2.2.25]
+                    0xF01B => {
+                        let skip = match r.instance {
+                            0x216 => 50usize,
+                            0x217 => 66,
+                            _ => unreachable!(),
+                        };
+                        Ok(("wmf", skip))
+                    }
+                    // OfficeArtBlipPICT [MS-ODRAW 2.2.26]
+                    0xF01C => {
+                        let skip = match r.instance {
+                            0x542 => 50usize,
+                            0x543 => 66,
+                            _ => unreachable!(),
+                        };
+                        Ok(("pict", skip))
+                    }
+                    // OfficeArtBlipJPEG [MS-ODRAW 2.2.27]
+                    0xF01D | 0xF02A => {
+                        let skip = match r.instance {
+                            0x46A | 0x6E2 => 17usize,
+                            0x46B | 0x6E3 => 33,
+                            _ => unreachable!(),
+                        };
+                        Ok(("jpg", skip))
+                    }
+                    // OfficeArtBlipPNG [MS-ODRAW 2.2.28]
+                    0xF01E => {
+                        let skip = match r.instance {
+                            0x6E0 => 17usize,
+                            0x6E1 => 33,
+                            _ => unreachable!(),
+                        };
+                        Ok(("png", skip))
+                    }
+                    // OfficeArtBlipDIB [MS-ODRAW 2.2.29]
+                    0xF01F => {
+                        let skip = match r.instance {
+                            0x7A8 => 17usize,
+                            0x7A9 => 33,
+                            _ => unreachable!(),
+                        };
+                        Ok(("dib", skip))
+                    }
+                    // OfficeArtBlipTIFF [MS-ODRAW 2.2.30]
+                    0xF029 => {
+                        let skip = match r.instance {
+                            0x6E4 => 17usize,
+                            0x6E5 => 33,
+                            _ => unreachable!(),
+                        };
+                        Ok(("tiff", skip))
+                    }
+                    _ => Err(XlsError::Art("picture type not support")),
+                };
+                let ext_skip = ext_skip?;
+                pics.push((ext_skip.0.to_string(), Vec::from(&r.data[ext_skip.1..])));
+            }
+            _ => {}
+        }
+    }
+    Ok(pics)
 }

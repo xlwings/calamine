@@ -24,6 +24,10 @@ pub enum DataType {
     Bool(bool),
     /// Date or Time
     DateTime(f64),
+    /// Date, Time or DateTime in ISO 8601
+    DateTimeIso(String),
+    /// Duration in ISO 8601
+    DurationIso(String),
     /// Error
     Error(CellErrorType),
     /// Empty cell
@@ -110,18 +114,34 @@ impl DataType {
     /// Try converting data type into a date
     #[cfg(feature = "dates")]
     pub fn as_date(&self) -> Option<chrono::NaiveDate> {
-        self.as_datetime().map(|dt| dt.date())
+        use std::str::FromStr;
+        match self {
+            DataType::DateTimeIso(s) => self
+                .as_datetime()
+                .map(|dt| dt.date())
+                .or_else(|| chrono::NaiveDate::from_str(s).ok()),
+            _ => self.as_datetime().map(|dt| dt.date()),
+        }
     }
 
     /// Try converting data type into a time
     #[cfg(feature = "dates")]
     pub fn as_time(&self) -> Option<chrono::NaiveTime> {
-        self.as_datetime().map(|dt| dt.time())
+        use std::str::FromStr;
+        match self {
+            DataType::DateTimeIso(s) => self
+                .as_datetime()
+                .map(|dt| dt.time())
+                .or_else(|| chrono::NaiveTime::from_str(s).ok()),
+            DataType::DurationIso(s) => chrono::NaiveTime::parse_from_str(s, "PT%HH%MM%S%.fS").ok(),
+            _ => self.as_datetime().map(|dt| dt.time()),
+        }
     }
 
     /// Try converting data type into a datetime
     #[cfg(feature = "dates")]
     pub fn as_datetime(&self) -> Option<chrono::NaiveDateTime> {
+        use std::str::FromStr;
         const MS_MULTIPLIER: f64 = 24f64 * 60f64 * 60f64 * 1e+3f64;
 
         match self {
@@ -134,9 +154,10 @@ impl DataType {
                 let excel_epoch = EXCEL_EPOCH
                     .get_or_init(|| chrono::NaiveDate::from_ymd(1899, 12, 30).and_hms(0, 0, 0));
                 let ms = f * MS_MULTIPLIER;
-                let excel_duration = chrono::Duration::milliseconds(ms as i64);
-                Some(*excel_epoch + excel_duration)
+                let excel_duration = chrono::Duration::milliseconds(ms.round() as i64);
+                excel_epoch.checked_add_signed(excel_duration)
             }
+            DataType::DateTimeIso(s) => chrono::NaiveDateTime::from_str(s).ok(),
             _ => None,
         }
     }
@@ -186,6 +207,8 @@ impl fmt::Display for DataType {
             DataType::String(ref e) => write!(f, "{}", e),
             DataType::Bool(ref e) => write!(f, "{}", e),
             DataType::DateTime(ref e) => write!(f, "{}", e),
+            DataType::DateTimeIso(ref e) => write!(f, "{}", e),
+            DataType::DurationIso(ref e) => write!(f, "{}", e),
             DataType::Error(ref e) => write!(f, "{}", e),
             DataType::Empty => Ok(()),
         }
@@ -329,6 +352,19 @@ mod tests {
                 NaiveTime::from_hms(19, 0, 0)
             ))
         );
+
+        // test rounding
+        assert_eq!(
+            DataType::Float(0.18737500000000001).as_time(),
+            Some(NaiveTime::from_hms_milli_opt(4, 29, 49, 200).unwrap())
+        );
+        assert_eq!(
+            DataType::Float(0.25951736111111101).as_time(),
+            Some(NaiveTime::from_hms_milli_opt(6, 13, 42, 300).unwrap())
+        );
+
+        // test overflow
+        assert_eq!(DataType::Float(1e20).as_time(), None);
 
         let unix_epoch_15h30m = DataType::Float(25569.645833333333333);
         let chrono_dt = NaiveDateTime::new(

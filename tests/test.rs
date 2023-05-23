@@ -1,5 +1,5 @@
 use calamine::CellErrorType::*;
-use calamine::DataType::{Bool, DateTime, Empty, Error, Float, String};
+use calamine::DataType::{Bool, DateTime, DateTimeIso, DurationIso, Empty, Error, Float, String};
 use calamine::{open_workbook, open_workbook_auto, Ods, Reader, Xls, Xlsb, Xlsx};
 use std::io::Cursor;
 use std::sync::Once;
@@ -234,7 +234,7 @@ fn ods() {
             [String("ab".to_string())],
             [Bool(false)],
             [String("test".to_string())],
-            [String("2016-10-20T00:00:00".to_string())]
+            [DateTimeIso("2016-10-20T00:00:00".to_string())]
         ]
     );
 
@@ -280,7 +280,12 @@ fn special_cells() {
         range,
         [
             [String("Split\nLine".to_string())],
-            [String("Value With spaces".to_string())],
+            [String("Value  With spaces".to_string())],
+            [String("Value   With 3 spaces".to_string())],
+            [String(" Value   With spaces before and after ".to_string())],
+            [String(
+                "  Value   With 2 spaces before and after  ".to_string()
+            )],
         ]
     );
 }
@@ -735,11 +740,131 @@ fn table() {
 }
 
 #[test]
-fn date() {
+fn date_xls() {
+    setup();
+
+    let path = format!("{}/tests/date.xls", env!("CARGO_MANIFEST_DIR"));
+    let mut xls: Xls<_> = open_workbook(&path).unwrap();
+    let range = xls.worksheet_range_at(0).unwrap().unwrap();
+
+    assert_eq!(range.get_value((0, 0)), Some(&DateTime(44197.0)));
+
+    #[cfg(feature = "dates")]
+    {
+        let date = chrono::NaiveDate::from_ymd_opt(2021, 01, 01).unwrap();
+        assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
+    }
+}
+
+#[test]
+fn date_xlsx() {
     setup();
 
     let path = format!("{}/tests/date.xlsx", env!("CARGO_MANIFEST_DIR"));
     let mut xls: Xlsx<_> = open_workbook(&path).unwrap();
+    let range = xls.worksheet_range_at(0).unwrap().unwrap();
+
+    assert_eq!(range.get_value((0, 0)), Some(&DateTime(44197.0)));
+
+    #[cfg(feature = "dates")]
+    {
+        let date = chrono::NaiveDate::from_ymd(2021, 01, 01);
+        assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
+    }
+}
+
+#[test]
+fn date_xlsx_iso() {
+    setup();
+
+    let path = format!("{}/tests/date_iso.xlsx", env!("CARGO_MANIFEST_DIR"));
+    let mut xls: Xlsx<_> = open_workbook(&path).unwrap();
+    let range = xls.worksheet_range_at(0).unwrap().unwrap();
+
+    assert_eq!(
+        range.get_value((0, 0)),
+        Some(&DateTimeIso("2021-01-01".to_string()))
+    );
+    assert_eq!(
+        range.get_value((1, 0)),
+        Some(&DateTimeIso("2021-01-01T10:10:10".to_string()))
+    );
+    assert_eq!(
+        range.get_value((2, 0)),
+        Some(&DateTimeIso("10:10:10".to_string()))
+    );
+
+    #[cfg(feature = "dates")]
+    {
+        let date = chrono::NaiveDate::from_ymd_opt(2021, 01, 01).unwrap();
+        assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
+        assert_eq!(range.get_value((0, 0)).unwrap().as_time(), None);
+        assert_eq!(range.get_value((0, 0)).unwrap().as_datetime(), None);
+
+        let time = chrono::NaiveTime::from_hms_opt(10, 10, 10).unwrap();
+        assert_eq!(range.get_value((2, 0)).unwrap().as_time(), Some(time));
+        assert_eq!(range.get_value((2, 0)).unwrap().as_date(), None);
+        assert_eq!(range.get_value((2, 0)).unwrap().as_datetime(), None);
+
+        let datetime = chrono::NaiveDateTime::new(date, time);
+        assert_eq!(
+            range.get_value((1, 0)).unwrap().as_datetime(),
+            Some(datetime)
+        );
+        assert_eq!(range.get_value((1, 0)).unwrap().as_time(), Some(time));
+        assert_eq!(range.get_value((1, 0)).unwrap().as_date(), Some(date));
+    }
+}
+
+#[test]
+fn date_ods() {
+    setup();
+
+    let path = format!("{}/tests/date.ods", env!("CARGO_MANIFEST_DIR"));
+    let mut ods: Ods<_> = open_workbook(&path).unwrap();
+    let range = ods.worksheet_range_at(0).unwrap().unwrap();
+
+    assert_eq!(
+        range.get_value((0, 0)),
+        Some(&DateTimeIso("2021-01-01".to_string()))
+    );
+    assert_eq!(
+        range.get_value((1, 0)),
+        Some(&DateTimeIso("2021-01-01T10:10:10".to_string()))
+    );
+    assert_eq!(
+        range.get_value((2, 0)),
+        Some(&DurationIso("PT10H10M10S".to_string()))
+    );
+    assert_eq!(
+        range.get_value((3, 0)),
+        Some(&DurationIso("PT10H10M10.123456S".to_string()))
+    );
+
+    #[cfg(feature = "dates")]
+    {
+        let date = chrono::NaiveDate::from_ymd_opt(2021, 01, 01).unwrap();
+        assert_eq!(range.get_value((0, 0)).unwrap().as_date(), Some(date));
+
+        let time = chrono::NaiveTime::from_hms_opt(10, 10, 10).unwrap();
+        assert_eq!(range.get_value((2, 0)).unwrap().as_time(), Some(time));
+
+        let datetime = chrono::NaiveDateTime::new(date, time);
+        assert_eq!(
+            range.get_value((1, 0)).unwrap().as_datetime(),
+            Some(datetime)
+        );
+
+        let time = chrono::NaiveTime::from_hms_micro_opt(10, 10, 10, 123456).unwrap();
+        assert_eq!(range.get_value((3, 0)).unwrap().as_time(), Some(time));
+    }
+}
+#[test]
+fn date_xlsb() {
+    setup();
+
+    let path = format!("{}/tests/date.xlsb", env!("CARGO_MANIFEST_DIR"));
+    let mut xls: Xlsb<_> = open_workbook(&path).unwrap();
     let range = xls.worksheet_range_at(0).unwrap().unwrap();
 
     assert_eq!(range.get_value((0, 0)), Some(&DateTime(44197.0)));
@@ -829,6 +954,107 @@ fn issue_271() -> Result<(), calamine::Error> {
     assert_eq!(values.len(), 1);
 
     Ok(())
+}
+
+// cargo test --features picture
+#[test]
+#[cfg(feature = "picture")]
+fn pictures() -> Result<(), calamine::Error> {
+    let jpg_path = format!("{}/tests/picture.jpg", env!("CARGO_MANIFEST_DIR"));
+    let png_path = format!("{}/tests/picture.png", env!("CARGO_MANIFEST_DIR"));
+
+    let xlsx_path = format!("{}/tests/picture.xlsx", env!("CARGO_MANIFEST_DIR"));
+    let xlsb_path = format!("{}/tests/picture.xlsb", env!("CARGO_MANIFEST_DIR"));
+    let xls_path = format!("{}/tests/picture.xls", env!("CARGO_MANIFEST_DIR"));
+    let ods_path = format!("{}/tests/picture.ods", env!("CARGO_MANIFEST_DIR"));
+
+    let jpg_hash = sha256::digest(&*std::fs::read(&jpg_path)?);
+    let png_hash = sha256::digest(&*std::fs::read(&png_path)?);
+
+    let xlsx: Xlsx<_> = open_workbook(xlsx_path)?;
+    let xlsb: Xlsb<_> = open_workbook(xlsb_path)?;
+    let xls: Xls<_> = open_workbook(xls_path)?;
+    let ods: Ods<_> = open_workbook(ods_path)?;
+
+    let mut pictures = Vec::with_capacity(8);
+    let mut pass = 0;
+
+    if let Some(pics) = xlsx.pictures() {
+        pictures.extend(pics);
+    }
+    if let Some(pics) = xlsb.pictures() {
+        pictures.extend(pics);
+    }
+    if let Some(pics) = xls.pictures() {
+        pictures.extend(pics);
+    }
+    if let Some(pics) = ods.pictures() {
+        pictures.extend(pics);
+    }
+    for (ext, data) in pictures {
+        let pic_hash = sha256::digest(&*data);
+        if ext == "jpg" || ext == "jpeg" {
+            assert_eq!(jpg_hash, pic_hash);
+        } else if ext == "png" {
+            assert_eq!(png_hash, pic_hash);
+        }
+        pass += 1;
+    }
+    assert_eq!(pass, 8);
+
+    Ok(())
+}
+
+#[test]
+fn ods_merged_cells() {
+    setup();
+
+    let path = format!("{}/tests/merged_cells.ods", env!("CARGO_MANIFEST_DIR"));
+    let mut ods: Ods<_> = open_workbook(&path).unwrap();
+    let range = ods.worksheet_range_at(0).unwrap().unwrap();
+
+    range_eq!(
+        range,
+        [
+            [
+                String("A".to_string()),
+                String("B".to_string()),
+                String("C".to_string())
+            ],
+            [
+                String("A".to_string()),
+                String("B".to_string()),
+                String("C".to_string())
+            ],
+            [Empty, Empty, String("C".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn ods_number_rows_repeated() {
+    setup();
+
+    let path = format!(
+        "{}/tests/number_rows_repeated.ods",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut ods: Ods<_> = open_workbook(&path).unwrap();
+    let range = ods.worksheet_range_at(0).unwrap().unwrap();
+
+    range_eq!(
+        range,
+        [
+            [String("A".to_string()), String("B".to_string())],
+            [String("C".to_string()), String("D".to_string())],
+            [String("C".to_string()), String("D".to_string())],
+            [Empty, Empty],
+            [Empty, Empty],
+            [String("C".to_string()), String("D".to_string())],
+            [Empty, Empty],
+            [String("C".to_string()), String("D".to_string())],
+        ]
+    );
 }
 
 #[test]

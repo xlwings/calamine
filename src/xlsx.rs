@@ -12,6 +12,7 @@ use quick_xml::Reader as XmlReader;
 use zip::read::{ZipArchive, ZipFile};
 use zip::result::ZipError;
 
+use crate::formats::{is_builtin_date_format_id, is_custom_date_format};
 use crate::vba::VbaProject;
 use crate::{Cell, CellErrorType, CellType, DataType, Metadata, Range, Reader, Table};
 
@@ -163,6 +164,9 @@ pub struct Xlsx<RS> {
     formats: Vec<CellFormat>,
     /// Metadata
     metadata: Metadata,
+    /// Pictures
+    #[cfg(feature = "picture")]
+    pictures: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl<RS: Read + Seek> Xlsx<RS> {
@@ -221,7 +225,9 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                     _ => (),
                                 }
                             }
-                            number_formats.insert(id, format);
+                            if !format.is_empty() {
+                                number_formats.insert(id, format);
+                            }
                         }
                         Ok(Event::End(ref e)) if e.local_name().as_ref() == b"numFmts" => break,
                         Ok(Event::Eof) => return Err(XlsxError::XmlEof("numFmts")),
@@ -549,6 +555,35 @@ impl<RS: Read + Seek> Xlsx<RS> {
         Ok(())
     }
 
+    /// Read pictures
+    #[cfg(feature = "picture")]
+    fn read_pictures(&mut self) -> Result<(), XlsxError> {
+        let mut pics = Vec::new();
+        for i in 0..self.zip.len() {
+            let mut zfile = self.zip.by_index(i)?;
+            let zname = zfile.name().to_owned();
+            if zname.starts_with("xl/media") {
+                let name_ext: Vec<&str> = zname.split(".").collect();
+                if let Some(ext) = name_ext.last() {
+                    if [
+                        "emf", "wmf", "pict", "jpeg", "jpg", "png", "dib", "gif", "tiff", "eps",
+                        "bmp", "wpg",
+                    ]
+                    .contains(ext)
+                    {
+                        let mut buf: Vec<u8> = Vec::new();
+                        zfile.read_to_end(&mut buf)?;
+                        pics.push((ext.to_string(), buf));
+                    }
+                }
+            }
+        }
+        if !pics.is_empty() {
+            self.pictures = Some(pics);
+        }
+        Ok(())
+    }
+
     /// Load the tables from
     pub fn load_tables(&mut self) -> Result<(), XlsxError> {
         if self.tables.is_none() {
@@ -697,11 +732,16 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
             sheets: Vec::new(),
             tables: None,
             metadata: Metadata::default(),
+            #[cfg(feature = "picture")]
+            pictures: None,
         };
         xlsx.read_shared_strings()?;
         xlsx.read_styles()?;
         let relationships = xlsx.read_relationships()?;
         xlsx.read_workbook(&relationships)?;
+        #[cfg(feature = "picture")]
+        xlsx.read_pictures()?;
+
         Ok(xlsx)
     }
 
@@ -719,8 +759,8 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
     }
 
     fn worksheet_range(&mut self, name: &str) -> Option<Result<Range<DataType>, XlsxError>> {
-        let xml = match self.sheets.iter().find(|&&(ref n, _)| n == name) {
-            Some(&(_, ref path)) => xml_reader(&mut self.zip, path),
+        let xml = match self.sheets.iter().find(|&(n, _)| n == name) {
+            Some((_, path)) => xml_reader(&mut self.zip, path),
             None => return None,
         };
         let strings = &self.strings;
@@ -733,8 +773,8 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
     }
 
     fn worksheet_formula(&mut self, name: &str) -> Option<Result<Range<String>, XlsxError>> {
-        let xml = match self.sheets.iter().find(|&&(ref n, _)| n == name) {
-            Some(&(_, ref path)) => xml_reader(&mut self.zip, path),
+        let xml = match self.sheets.iter().find(|&(n, _)| n == name) {
+            Some((_, path)) => xml_reader(&mut self.zip, path),
             None => return None,
         };
 
@@ -787,6 +827,11 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
                 Some((name, range))
             })
             .collect()
+    }
+
+    #[cfg(feature = "picture")]
+    fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        self.pictures.to_owned()
     }
 }
 
@@ -874,11 +919,11 @@ fn read_sheet_data(
     cells: &mut Vec<Cell<DataType>>,
 ) -> Result<(), XlsxError> {
     /// read the contents of a <v> cell
-    fn read_value<'a>(
+    fn read_value(
         v: String,
         strings: &[String],
         formats: &[CellFormat],
-        c_element: &BytesStart<'a>,
+        c_element: &BytesStart<'_>,
     ) -> Result<DataType, XlsxError> {
         let is_date_time = match get_attribute(c_element.attributes(), QName(b"s")) {
             Ok(Some(style)) => {
@@ -907,9 +952,7 @@ fn read_sheet_data(
             }
             Some(b"d") => {
                 // date
-                // TODO: create a DataType::Date
-                // currently just return as string (ISO 8601)
-                Ok(DataType::String(v))
+                Ok(DataType::DateTimeIso(v))
             }
             Some(b"str") => {
                 // see http://officeopenxml.com/SScontentOverview.php
@@ -1002,42 +1045,6 @@ fn read_sheet_data(
     })
 }
 
-// This tries to detect number formats that are definitely date/time formats.
-// This is definitely not perfect!
-fn is_custom_date_format(format: &str) -> bool {
-    format.bytes().all(|c| b"mdyMDYhsHS-/.: \\".contains(&c))
-}
-
-fn is_builtin_date_format_id(id: &[u8]) -> bool {
-    match id {
-    // mm-dd-yy
-    b"14" |
-    // d-mmm-yy
-    b"15" |
-    // d-mmm
-    b"16" |
-    // mmm-yy
-    b"17" |
-    // h:mm AM/PM
-    b"18" |
-    // h:mm:ss AM/PM
-    b"19" |
-    // h:mm
-    b"20" |
-    // h:mm:ss
-    b"21" |
-    // m/d/yy h:mm
-    b"22" |
-    // mm:ss
-    b"45" |
-    // [h]:mm:ss
-    b"46" |
-    // mmss.0
-    b"47" => true,
-    _ => false
-    }
-}
-
 #[derive(Debug, PartialEq)]
 struct Dimensions {
     start: (u32, u32),
@@ -1123,7 +1130,7 @@ fn get_row_column(range: &[u8]) -> Result<(u32, u32), XlsxError> {
             _ => return Err(XlsxError::Alphanumeric(*c)),
         }
     }
-    Ok((row - 1, col - 1))
+    Ok((row.saturating_sub(1), col - 1))
 }
 
 /// attempts to read either a simple or richtext string
